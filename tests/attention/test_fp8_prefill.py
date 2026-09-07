@@ -204,6 +204,149 @@ def test_batch_prefill_with_ragged_kv_cache_fp8(
     torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("wrapper_kind", ["ragged", "paged"])
+@pytest.mark.parametrize("disable_split_kv", [True, False])
+def test_batch_prefill_fp8_repack_head_dim_96(wrapper_kind, disable_split_kv):
+    """D=96 FP8-KV repack must use the padded physical SMEM row stride.
+
+    The logical D=96 rows contain 6 packed FP8 b128s, but the shared-memory
+    tile is padded to 128 elements (8 FP8 b128s / 16 FP16 b128s).  A compact
+    batch case with long KV sequences exercises both the regular and split-KV
+    loaders for ragged and paged caches.
+    """
+    if get_compute_capability(torch.device("cuda:0"))[0] < 8:
+        pytest.skip("FA2 FP8 KV repack requires Ampere or newer")
+
+    torch.manual_seed(20260907)
+    head_dim = 96
+    num_qo_heads, num_kv_heads = 4, 2
+    qo_lens, kv_lens = [128, 96], [2048, 1536]
+    total_qo_len, total_kv_len = sum(qo_lens), sum(kv_lens)
+    q = torch.randn(
+        total_qo_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    k16 = torch.randn(
+        total_kv_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    v16 = torch.randn(
+        total_kv_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    k8 = k16.to(torch.float8_e4m3fn)
+    v8 = v16.to(torch.float8_e4m3fn)
+    qo_indptr = torch.tensor(
+        [0, qo_lens[0], total_qo_len], dtype=torch.int32, device="cuda"
+    )
+
+    if wrapper_kind == "ragged":
+        kv_indptr = torch.tensor(
+            [0, kv_lens[0], total_kv_len], dtype=torch.int32, device="cuda"
+        )
+        wrapper_ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda"),
+            "NHD",
+            backend="fa2",
+        )
+        wrapper_ref.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+        o_ref, lse_ref = wrapper_ref.run(
+            q, k8.to(torch.float16), v8.to(torch.float16), return_lse=True
+        )
+        wrapper_f8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda"),
+            "NHD",
+            backend="fa2",
+        )
+        plan_kwargs = dict(
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            disable_split_kv=disable_split_kv,
+        )
+        if not disable_split_kv:
+            plan_kwargs["fixed_split_size"] = 128
+        wrapper_f8.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+            **plan_kwargs,
+        )
+        o_f8, lse_f8 = wrapper_f8.run(q, k8, v8, return_lse=True)
+    else:
+        page_size = 16
+        pages_per_seq = [kv_len // page_size for kv_len in kv_lens]
+        kv_indptr = torch.tensor(
+            [0, pages_per_seq[0], sum(pages_per_seq)], dtype=torch.int32, device="cuda"
+        )
+        kv_indices = torch.arange(sum(pages_per_seq), dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor(
+            [page_size, page_size], dtype=torch.int32, device="cuda"
+        )
+        paged_k16 = k16.view(-1, page_size, num_kv_heads, head_dim)
+        paged_v16 = v16.view(-1, page_size, num_kv_heads, head_dim)
+        paged_k8 = k8.view(-1, page_size, num_kv_heads, head_dim)
+        paged_v8 = v8.view(-1, page_size, num_kv_heads, head_dim)
+        wrapper_ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda"),
+            "NHD",
+            backend="fa2",
+        )
+        wrapper_ref.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+        o_ref, lse_ref = wrapper_ref.run(q, (paged_k16, paged_v16), return_lse=True)
+        wrapper_f8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda"),
+            "NHD",
+            backend="fa2",
+        )
+        plan_kwargs = dict(
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            disable_split_kv=disable_split_kv,
+        )
+        if not disable_split_kv:
+            plan_kwargs["fixed_split_size"] = 8
+        wrapper_f8.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            **plan_kwargs,
+        )
+        o_f8, lse_f8 = wrapper_f8.run(q, (paged_k8, paged_v8), return_lse=True)
+
+    assert bool(wrapper_f8._plan_info[-1]) == (not disable_split_kv)
+    torch.testing.assert_close(o_f8.float(), o_ref.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_f8, lse_ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
